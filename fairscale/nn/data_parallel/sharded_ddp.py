@@ -96,9 +96,9 @@ class ShardedDataParallel(nn.Module):
         process_group: Any = None,
         broadcast_buffers: bool = True,
         sync_models_at_startup: bool = True,
-        reduce_buffer_size: int = 2 ** 23,
+        reduce_buffer_size: int = 0,
         auto_refresh_trainable: bool = True,
-        reduce_fp16: bool = False,
+        reduce_fp16: bool = True,
     ):
         super().__init__()
 
@@ -155,6 +155,7 @@ class ShardedDataParallel(nn.Module):
         self._grad_to_be_reduced: List[bool] = []
         self._trainable_param_to_rank: Dict[torch.Tensor, int] = {}
         self._reference_trainable_mask = list(map(_trainable, self._all_params))
+        self._grad_buffer: List[Optional[torch.Tensor]] = []
 
         # - setup buckets and tensor views
         model_size = sum([p.numel() for p in self.module.parameters()])
@@ -268,6 +269,7 @@ class ShardedDataParallel(nn.Module):
         self._trainable_params = list(filter(lambda x: x.requires_grad, self._all_params))
         self._trainable_params.sort(key=lambda x: x.numel())
         self._grad_to_be_reduced = [True for _ in self._trainable_params]
+        self._grad_buffer = [None for _ in self._trainable_params]
 
         self._trainable_param_to_rank = {}
         for optim in self.sharded_optimizers:
@@ -411,21 +413,27 @@ class ShardedDataParallel(nn.Module):
                     param.grad.mul_(self.world_size_scaling)
 
                     if self.reduce_fp16:
-                        param.grad.data = param.grad.data.half()
+                        self._grad_buffer[index] = param.grad.half()
+                    else:
+                        self._grad_buffer[index] = param.grad.data
 
                     # Future work includes clearing up the buffer if possible
                     def cleanup() -> None:
                         if dst_rank != self.global_rank:
                             param.grad = None
-                        else:
-                            assert param.grad is not None
-                            param.grad.data = param.grad.data.to(dtype=param.dtype)
+                        elif self.reduce_fp16:
+                            assert self._grad_buffer[index] is not None
+                            param.grad = self._grad_buffer[index].to(param.dtype)  # type:ignore
+
+                        self._grad_buffer[index] = None
 
                     # Async reduce for this buffer, log the future
+                    assert self._grad_buffer[index] is not None
+
                     self._work_handles.append(
                         Workhandle(
                             handle=dist.reduce(
-                                tensor=param.grad.data,
+                                tensor=self._grad_buffer[index],  # type:ignore
                                 dst=self._local_to_global_rank[dst_rank],
                                 group=self.process_group,
                                 async_op=True,
