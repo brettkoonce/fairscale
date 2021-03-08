@@ -311,16 +311,15 @@ class ShardedDataParallel(nn.Module):
             blocking (bool): wait for the operation to conclude.
         """
 
-        last_work_handle = None
+        work_handles = []
 
         for buffer in self.module.buffers(recurse=True):
-            last_work_handle = dist.broadcast(
-                buffer.data, self.reference_global_rank, self.process_group, async_op=True
+            work_handles.append(
+                dist.broadcast(buffer.data, self.reference_global_rank, self.process_group, async_op=True)
             )
 
-        if blocking and last_work_handle:
-            # Only wait for the last coms, they're inlined on the same CUDA stream
-            last_work_handle.wait()
+        if blocking:
+            _ = list(filter(lambda x: x.wait(), work_handles))
 
     def zero_grad(self, set_to_none: bool = False) -> None:
         r"""Sets gradients of all model parameters to zero. See similar function
@@ -505,16 +504,15 @@ class ShardedDataParallel(nn.Module):
         Sync the complete model states in between the ranks
         """
 
-        last_work_handle = None
+        work_handles = []
 
         for t in self.module.state_dict().values():
-            last_work_handle = dist.broadcast(
-                t, src=self.reference_global_rank, group=self.process_group, async_op=True
+            work_handles.append(
+                dist.broadcast(t, src=self.reference_global_rank, group=self.process_group, async_op=True)
             )
 
-        # Only wait for the last handle, they're inlined in the same CUDA stream
-        if last_work_handle:
-            last_work_handle.wait()
+        # gloo does not guarantee inlining like NCCL, wait for all requests
+        _ = list(filter(lambda x: x.wait(), work_handles))
 
     def _passing_sync_batchnorm_handle(self, module: nn.Module) -> None:
         """
