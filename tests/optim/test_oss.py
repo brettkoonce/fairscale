@@ -22,7 +22,13 @@ import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 import fairscale.optim as optim
-from fairscale.utils.testing import check_same_model_params, skip_if_no_cuda, skip_if_py39_no_cuda, skip_if_single_gpu
+from fairscale.utils.testing import (
+    check_same_model_params,
+    check_same_models_across_ranks,
+    skip_if_no_cuda,
+    skip_if_py39_no_cuda,
+    skip_if_single_gpu,
+)
 
 BACKEND = dist.Backend.NCCL if torch.cuda.is_available() else dist.Backend.GLOO  # type: ignore
 DEVICE = "cuda" if torch.cuda.is_available() else torch.device("cpu")
@@ -437,6 +443,14 @@ def run_test_collect_shards(rank, world_size, reference_rank, tempfile_name):
 
     # Load the optimizer state dict
     optimizer.load_state_dict(optimizer_state_dict)
+
+    # Test the state dict materialization on all ranks
+    _ = optimizer.step(closure=closure)
+    optimizer_state_dict = optimizer.state_dict(all_ranks=True)  # one per rank
+    optimizer.load_state_dict(optimizer_state_dict)
+    _ = optimizer.step(closure=closure)
+    check_same_models_across_ranks(model, dist.group.WORLD, params_should_be_equal=True, check_broadcast_buffers=False)
+
     dist.destroy_process_group()
 
 
